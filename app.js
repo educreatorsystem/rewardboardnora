@@ -2,7 +2,9 @@ const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTRGbXpxUToXp1Q
 const GVIZ_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTRGbXpxUToXp1QPkTDsm0FpiD18uhQgpxLkwOJDdtS3tIM5MHCyvSShfwbb4TjMK5S-QLViJ9uoDlL/gviz/tq?gid=0&headers=1&tqx=out:json";
 const APPSCRIPT_URL = "https://script.google.com/macros/s/AKfycbyusPQtrUJaOgDVgnR0tDfupC5xrM1zuaJE8aS2_GxwK4YPkykW97rHlWdrGlK_J062mQ/exec";
 const STORAGE_KEY = "reward-board-state-v2";
-const SYNC_INTERVAL_MS = 4000;
+const SYNC_INTERVAL_MS = 8000;
+const BACKEND_BATCH_DELAY_MS = 180;
+const LOCAL_SYNC_GUARD_MS = 3500;
 
 const state = {
   students: [],
@@ -13,6 +15,8 @@ const state = {
   pickerSelection: null,
   syncTimer: null,
   lastLocalChangeAt: 0,
+  lastBackendRevision: 0,
+  backendSupportsBatch: false,
   timer: {
     initial: 60,
     remaining: 60,
@@ -22,6 +26,11 @@ const state = {
 };
 
 const el = {};
+let backendQueue = [];
+let backendFlushTimer = null;
+let backendInFlight = false;
+let localSaveTimer = null;
+let leaderboardRenderQueued = false;
 
 document.addEventListener("DOMContentLoaded", () => {
   bindElements();
@@ -246,12 +255,42 @@ function startSyncPolling() {
 }
 
 async function syncFromBackend(force) {
-  if (!force && Date.now() - state.lastLocalChangeAt < 2500) return;
+  const hasPendingWrites = backendQueue.length > 0 || backendInFlight;
+  if (!force && (Date.now() - state.lastLocalChangeAt < LOCAL_SYNC_GUARD_MS || hasPendingWrites)) return;
   try {
     const backendState = await loadBackendState();
     if (!backendState || !backendState.ok) throw new Error("State backend tidak sah");
+
+    // Backend lama hanya memulangkan {ok:true,message:...}. Jangan sesekali
+    // kosongkan skor tempatan jika endpoint getState belum disokong.
+    const supportsSharedState = Object.prototype.hasOwnProperty.call(backendState, "initialized")
+      || Object.prototype.hasOwnProperty.call(backendState, "scores")
+      || Object.prototype.hasOwnProperty.call(backendState, "groups");
+    if (!supportsSharedState) {
+      state.backendSupportsBatch = false;
+      setSync("Sync tempatan");
+      return;
+    }
+    state.backendSupportsBatch = true;
+
+    // Deploy baharu: jadikan data browser semasa sebagai state permulaan supaya
+    // rekod sedia ada tidak hilang pada sync pertama.
+    if (backendState.initialized === false) {
+      postBackendAction({
+        action: "replaceState",
+        scores: state.scores,
+        groups: state.groups
+      }, true);
+      setSync("Menyediakan sync...");
+      return;
+    }
+
+    const revision = Number(backendState.revision || 0);
+    if (!force && revision && revision < state.lastBackendRevision) return;
+
     state.scores = backendState.scores || {};
     state.groups = backendState.groups || {};
+    state.lastBackendRevision = revision;
     ensureScoreKeys();
     ensureGroupsForClasses();
     saveLocalState();
@@ -295,16 +334,80 @@ function markLocalChange() {
   state.lastLocalChangeAt = Date.now();
 }
 
-function postBackendAction(payload) {
+function scheduleLocalStateSave() {
+  clearTimeout(localSaveTimer);
+  localSaveTimer = setTimeout(() => {
+    saveLocalState();
+    localSaveTimer = null;
+  }, 40);
+}
+
+function postBackendAction(payload, flushNow = false) {
+  const actionPayload = {
+    timestamp: new Date().toISOString(),
+    ...payload
+  };
+
+  // Serasi dengan Code.gs lama: sebelum endpoint getState baharu dikesan,
+  // hantar satu tindakan seperti versi asal supaya log reward tidak rosak.
+  if (!state.backendSupportsBatch) {
+    sendSingleBackendAction(actionPayload);
+    return;
+  }
+
+  backendQueue.push(actionPayload);
+  setSync("Menyimpan...");
+  clearTimeout(backendFlushTimer);
+  if (flushNow) {
+    backendFlushTimer = null;
+    flushBackendQueue();
+  } else {
+    backendFlushTimer = setTimeout(flushBackendQueue, BACKEND_BATCH_DELAY_MS);
+  }
+}
+
+function sendSingleBackendAction(actionPayload) {
+  setSync("Menyimpan...");
   fetch(APPSCRIPT_URL, {
     method: "POST",
     mode: "no-cors",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({
-      timestamp: new Date().toISOString(),
-      ...payload
-    })
-  }).catch(() => {});
+    body: JSON.stringify(actionPayload)
+  }).then(() => setSync("Disimpan")).catch((error) => {
+    setSync("Simpan tempatan");
+    console.warn(error);
+  });
+}
+
+async function flushBackendQueue() {
+  if (backendInFlight || !backendQueue.length) return;
+  clearTimeout(backendFlushTimer);
+  backendFlushTimer = null;
+
+  const actions = backendQueue.splice(0, backendQueue.length);
+  backendInFlight = true;
+  try {
+    await fetch(APPSCRIPT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({
+        action: "batch",
+        timestamp: new Date().toISOString(),
+        actions
+      })
+    });
+    setSync("Disimpan");
+  } catch (error) {
+    backendQueue = actions.concat(backendQueue);
+    setSync("Simpan tempatan");
+    console.warn(error);
+  } finally {
+    backendInFlight = false;
+    if (backendQueue.length) {
+      backendFlushTimer = setTimeout(flushBackendQueue, BACKEND_BATCH_DELAY_MS);
+    }
+  }
 }
 
 function ensureScoreKeys() {
@@ -377,6 +480,39 @@ function studentCard(student) {
       </div>
     </article>
   `;
+}
+
+function updateStudentScoreDisplay(studentId) {
+  const card = el.studentGrid.querySelector(`[data-student-card="${studentId}"]`);
+  if (!card) return;
+  const stars = card.querySelector(".stars");
+  if (stars) stars.textContent = `⭐ ${state.scores[studentId] || 0}`;
+  card.classList.remove("pop");
+  void card.offsetWidth;
+  card.classList.add("pop");
+  setTimeout(() => card.classList.remove("pop"), 430);
+}
+
+function updateGroupScoreDisplay(groupId) {
+  const card = el.groupBoard.querySelector(`[data-group-card="${groupId}"]`);
+  if (!card) return;
+  const stars = card.querySelector(".group-head .stars");
+  const group = Object.values(state.groups).flat().find((item) => item.id === groupId);
+  if (stars && group) stars.textContent = `⭐ ${group.stars || 0}`;
+  card.classList.remove("pop");
+  void card.offsetWidth;
+  card.classList.add("pop");
+  setTimeout(() => card.classList.remove("pop"), 430);
+}
+
+function scheduleLeaderboardRender() {
+  const panel = document.getElementById("leaderboard");
+  if (!panel?.classList.contains("active") || leaderboardRenderQueued) return;
+  leaderboardRenderQueued = true;
+  requestAnimationFrame(() => {
+    leaderboardRenderQueued = false;
+    renderLeaderboard();
+  });
 }
 
 function generateRandomGroups() {
@@ -531,9 +667,15 @@ function updateStudentScore(studentId, delta, sourceButton) {
   const student = state.students.find((item) => item.id === studentId);
   if (!student) return;
   const rewardOrigin = getRewardOrigin(sourceButton);
+
+  // Optimistic UI: nombor berubah dahulu, sebelum localStorage/network dibuat.
   state.scores[studentId] = Math.max(0, (state.scores[studentId] || 0) + delta);
+  updateStudentScoreDisplay(studentId);
+  animateReward(rewardOrigin, delta);
+  scheduleLeaderboardRender();
+
   markLocalChange();
-  saveLocalState();
+  scheduleLocalStateSave();
   postBackendAction({
     action: "studentReward",
     studentId,
@@ -545,8 +687,6 @@ function updateStudentScore(studentId, delta, sourceButton) {
     score: state.scores[studentId],
     affectedStudents: [student.name]
   });
-  renderAll();
-  animateReward(rewardOrigin, delta);
 }
 
 function updateGroupScore(className, groupId, delta, sourceButton) {
@@ -564,12 +704,20 @@ function updateGroupScore(className, groupId, delta, sourceButton) {
       affectedStudentRecords.push({
         id: student.id,
         name: student.name,
-        className: student.className
+        className: student.className,
+        score: state.scores[studentId]
       });
+      updateStudentScoreDisplay(studentId);
     }
   });
+
+  // Kemas kini hanya kad yang terlibat; elakkan renderAll() yang berat.
+  updateGroupScoreDisplay(groupId);
+  animateReward(rewardOrigin, delta);
+  scheduleLeaderboardRender();
+
   markLocalChange();
-  saveLocalState();
+  scheduleLocalStateSave();
   postBackendAction({
     action: "groupReward",
     type: "group",
@@ -583,8 +731,6 @@ function updateGroupScore(className, groupId, delta, sourceButton) {
     affectedStudents,
     affectedStudentRecords
   });
-  renderAll();
-  animateReward(rewardOrigin, delta);
 }
 
 function setPickerMode(mode) {
